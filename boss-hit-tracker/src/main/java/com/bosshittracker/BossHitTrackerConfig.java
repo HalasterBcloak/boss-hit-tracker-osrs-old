@@ -43,12 +43,23 @@ public interface BossHitTrackerConfig extends Config
 		return true;
 	}
 
+	@ConfigItem(
+		keyName = "trackSpells",
+		name = "Track spells",
+		description = "Track magic hits per spell, e.g. \"Kodai wand (Ice Barrage)\", for both manual casts and autocast",
+		position = 3
+	)
+	default boolean trackSpells()
+	{
+		return true;
+	}
+
 	@Range(min = 1, max = 200)
 	@ConfigItem(
 		keyName = "historySize",
 		name = "Kills kept per boss",
 		description = "How many individual kills to keep in each boss's kill history",
-		position = 3
+		position = 4
 	)
 	default int historySize()
 	{

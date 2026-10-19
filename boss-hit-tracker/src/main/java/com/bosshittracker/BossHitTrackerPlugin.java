@@ -7,7 +7,9 @@ import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import com.google.gson.reflect.TypeToken;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -23,15 +25,24 @@ import net.runelite.api.GameState;
 import net.runelite.api.Hitsplat;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
+import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetUtil;
 import net.runelite.api.Player;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.AnimationChanged;
 import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
 import net.runelite.api.events.HitsplatApplied;
+import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.NpcDespawned;
+import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.VarPlayerID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
@@ -53,9 +64,15 @@ import net.runelite.client.util.Text;
 public class BossHitTrackerPlugin extends Plugin
 {
 	private static final String DATA_KEY = "data";
+	private static final String AUTOCAST_NAMES_KEY = "autocastNames";
+	/** Words in the autocast menu that aren't spell names. */
+	private static final Set<String> NOT_SPELL_NAMES = new HashSet<>(Arrays.asList(
+		"autocast", "select", "choose", "cancel", "ok", "close", "spells", "defensive", "back"));
 	private static final String UNARMED = "Unarmed";
 	/** How long (in game ticks) an attack animation's weapon is used for the hitsplats that follow it. */
 	private static final int ATTACK_WEAPON_TICKS = 8;
+	/** COM_MODE value used for autocast on staves. */
+	private static final int AUTOCAST_STYLE = 4;
 
 	@Inject
 	private Client client;
@@ -91,6 +108,13 @@ public class BossHitTrackerPlugin extends Plugin
 	// projectile is in flight still credits the weapon that made the attack.
 	private String lastAttackWeapon;
 	private int lastAttackTick = -100;
+	// Spell you clicked to cast on an NPC, used for your next attack
+	private String pendingCast;
+	// Spell clicked in the autocast menu, waiting for the game to confirm its number
+	private String pendingAutocastName;
+	private int pendingAutocastTick = -100;
+	// Autocast spell number -> spell name, learned when you pick a spell to autocast
+	private Map<Integer, String> autocastNames = new HashMap<>();
 
 	private BossHitTrackerPanel panel;
 	private NavigationButton navButton;
@@ -105,6 +129,7 @@ public class BossHitTrackerPlugin extends Plugin
 	protected void startUp()
 	{
 		parseExtraNames();
+		loadAutocastNames();
 
 		panel = new BossHitTrackerPanel(this);
 		navButton = NavigationButton.builder()
@@ -178,9 +203,239 @@ public class BossHitTrackerPlugin extends Plugin
 		}
 		if (local.getInteracting() instanceof NPC)
 		{
-			lastAttackWeapon = currentWeapon();
+			lastAttackWeapon = attackLabel();
 			lastAttackTick = client.getTickCount();
 		}
+	}
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event)
+	{
+		MenuAction action = event.getMenuAction();
+		if (WidgetUtil.componentToInterface(event.getWidgetId()) == InterfaceID.AUTOCAST)
+		{
+			// Picking a spell in the autocast menu: remember its name until the game confirms the choice
+			Widget widget = event.getWidget();
+			String name = firstSpellName(widget == null ? null : widget.getName(), event.getMenuTarget(), event.getMenuOption());
+			log.debug("Autocast menu click: option={} target={} -> {}", event.getMenuOption(), event.getMenuTarget(), name);
+			if (name != null)
+			{
+				pendingAutocastName = name;
+				pendingAutocastTick = client.getTickCount();
+			}
+			return;
+		}
+
+		if (action == MenuAction.WIDGET_TARGET_ON_NPC && "Cast".equalsIgnoreCase(Text.removeTags(event.getMenuOption())))
+		{
+			// Target looks like "Ice Barrage -> Vorkath  (level-732)"
+			String target = Text.removeTags(event.getMenuTarget());
+			int arrow = target.indexOf("->");
+			String spell = (arrow > 0 ? target.substring(0, arrow) : target).trim();
+			pendingCast = spell.isEmpty() ? null : spell;
+		}
+		else if (action == MenuAction.WALK
+			|| action == MenuAction.NPC_FIRST_OPTION
+			|| action == MenuAction.NPC_SECOND_OPTION
+			|| action == MenuAction.NPC_THIRD_OPTION
+			|| action == MenuAction.NPC_FOURTH_OPTION
+			|| action == MenuAction.NPC_FIFTH_OPTION)
+		{
+			// Walking away or a normal attack cancels a manual cast that never happened
+			pendingCast = null;
+		}
+	}
+
+	@Subscribe
+	public void onVarbitChanged(VarbitChanged event)
+	{
+		// The game confirmed a new autocast spell right after you clicked one
+		if (event.getVarbitId() == VarbitID.AUTOCAST_SPELL && pendingAutocastName != null
+			&& client.getTickCount() - pendingAutocastTick <= 10)
+		{
+			learnAutocastName(event.getValue());
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		// Re-picking the spell that's already set doesn't change the game value, so also check
+		// shortly after the click, once the autocast menu has closed (it closes on a successful pick).
+		if (pendingAutocastName == null || client.getTickCount() - pendingAutocastTick < 2)
+		{
+			return;
+		}
+		Widget menu = client.getWidget(InterfaceID.Autocast.UNIVERSE);
+		if (menu == null || menu.isHidden())
+		{
+			learnAutocastName(client.getVarbitValue(VarbitID.AUTOCAST_SPELL));
+		}
+		else if (client.getTickCount() - pendingAutocastTick > 10)
+		{
+			pendingAutocastName = null;
+		}
+	}
+
+	private void learnAutocastName(int spellIndex)
+	{
+		String name = pendingAutocastName;
+		pendingAutocastName = null;
+		if (spellIndex <= 0 || name == null)
+		{
+			return;
+		}
+		autocastNames.put(spellIndex, name);
+		configManager.setConfiguration(BossHitTrackerConfig.GROUP, AUTOCAST_NAMES_KEY, gson.toJson(autocastNames));
+		log.debug("Learned autocast spell {} = {}", spellIndex, name);
+		renameUnknownSpell(spellIndex, name);
+	}
+
+	/** Relabel hits saved before the spell's name was known, e.g. "Staff (Autocast spell 1)". */
+	private void renameUnknownSpell(int spellIndex, String name)
+	{
+		String oldSuffix = "(Autocast spell " + spellIndex + ")";
+		String newSuffix = "(" + name + ")";
+		boolean changed = false;
+		synchronized (lock)
+		{
+			for (BossStats stats : data.bosses.values())
+			{
+				changed |= renameKeys(stats.weapons, oldSuffix, newSuffix);
+				for (KillRecord kill : stats.getRecentKills())
+				{
+					changed |= renameKeys(kill.weapons, oldSuffix, newSuffix);
+				}
+			}
+			for (ActiveFight fight : activeFights.values())
+			{
+				renameKeys(fight.record.weapons, oldSuffix, newSuffix);
+			}
+			if (lastAttackWeapon != null && lastAttackWeapon.endsWith(oldSuffix))
+			{
+				lastAttackWeapon = lastAttackWeapon.substring(0, lastAttackWeapon.length() - oldSuffix.length()) + newSuffix;
+			}
+		}
+		if (changed)
+		{
+			saveData();
+			refreshPanel();
+		}
+	}
+
+	private static boolean renameKeys(Map<String, WeaponStats> weapons, String oldSuffix, String newSuffix)
+	{
+		if (weapons == null)
+		{
+			return false;
+		}
+		List<String> matches = new ArrayList<>();
+		for (String key : weapons.keySet())
+		{
+			if (key.endsWith(oldSuffix))
+			{
+				matches.add(key);
+			}
+		}
+		for (String key : matches)
+		{
+			WeaponStats stats = weapons.remove(key);
+			String renamed = key.substring(0, key.length() - oldSuffix.length()) + newSuffix;
+			WeaponStats existing = weapons.get(renamed);
+			if (existing == null)
+			{
+				weapons.put(renamed, stats);
+			}
+			else
+			{
+				existing.merge(stats);
+			}
+		}
+		return !matches.isEmpty();
+	}
+
+	private static String firstSpellName(String... candidates)
+	{
+		for (String c : candidates)
+		{
+			if (c == null)
+			{
+				continue;
+			}
+			String name = Text.removeTags(c).trim();
+			if (!name.isEmpty() && !"null".equalsIgnoreCase(name) && !NOT_SPELL_NAMES.contains(name.toLowerCase()))
+			{
+				return name;
+			}
+		}
+		return null;
+	}
+
+	private void loadAutocastNames()
+	{
+		Map<Integer, String> loaded = null;
+		String json = configManager.getConfiguration(BossHitTrackerConfig.GROUP, AUTOCAST_NAMES_KEY);
+		if (json != null && !json.isEmpty())
+		{
+			try
+			{
+				loaded = gson.fromJson(json, new TypeToken<Map<Integer, String>>(){}.getType());
+			}
+			catch (RuntimeException e)
+			{
+				log.warn("Couldn't read saved autocast spell names", e);
+			}
+		}
+		autocastNames = loaded == null ? new HashMap<>() : new HashMap<>(loaded);
+	}
+
+	/** What to call the attack you're starting now: the weapon, plus the spell if it's a spell. */
+	private String attackLabel()
+	{
+		String weapon = currentWeapon();
+		if (!config.trackSpells())
+		{
+			pendingCast = null;
+			return weapon;
+		}
+		String spell = pendingCast;
+		pendingCast = null;
+		if (spell == null)
+		{
+			spell = autocastSpell();
+		}
+		return spell == null ? weapon : weapon + " (" + spell + ")";
+	}
+
+	/** The spell being autocast, or null when you aren't autocasting. */
+	private String autocastSpell()
+	{
+		// Attack style slot 4 on a staff is autocast (normal or defensive)
+		if (client.getVarpValue(VarPlayerID.COM_MODE) != AUTOCAST_STYLE)
+		{
+			return null;
+		}
+		int spellIndex = client.getVarbitValue(VarbitID.AUTOCAST_SPELL);
+		String learned = autocastNames.get(spellIndex);
+		if (learned != null)
+		{
+			return learned;
+		}
+		int spellObj = client.getVarpValue(VarPlayerID.AUTOCAST_SPELL_OBJ);
+		if (spellObj > 0)
+		{
+			String name = itemManager.getItemComposition(spellObj).getName();
+			if (name != null)
+			{
+				// Strip any leading spell-number prefix, e.g. "94 Ice Barrage"
+				name = Text.removeTags(name).replaceFirst("^\\d+\\s+", "").trim();
+				if (!name.isEmpty() && !"null".equalsIgnoreCase(name))
+				{
+					return name;
+				}
+			}
+		}
+		return spellIndex > 0 ? "Autocast spell " + spellIndex : null;
 	}
 
 	@Subscribe
